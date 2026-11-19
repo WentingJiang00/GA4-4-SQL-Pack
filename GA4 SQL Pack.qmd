@@ -1,0 +1,206 @@
+---
+title: "GA4-4 SQL Pack"
+subtitle: "Eight GoogleSQL Queries"
+author: "Wenting Jiang"
+date: today
+format:
+  html:
+    theme: default
+    toc: true
+    toc-depth: 2
+    embed-resources: true
+    code-copy: true
+    code-overflow: wrap
+execute:
+  eval: false
+editor: visual
+---
+
+# Data source
+
+I used the public GA4 sample ecommerce data in BigQuery:
+
+`bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+
+The queries use January 2021 so the date range stays small. If the class uses a different GA4 table, the table name can be replaced.
+
+# Query 1: Daily event count
+
+``` sql
+SELECT
+  PARSE_DATE('%Y%m%d', event_date) AS event_day,
+  COUNT(*) AS total_events
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+WHERE _TABLE_SUFFIX BETWEEN '20210101' AND '20210131'
+GROUP BY event_day
+ORDER BY event_day;
+```
+
+This query counts all events for each day in January. The output can show whether activity changed during the month. It is a simple first check, but events are not the same as users.
+
+# Query 2: Most viewed pages
+
+``` sql
+SELECT
+  (SELECT value.string_value
+   FROM UNNEST(event_params)
+   WHERE key = 'page_location') AS page_location,
+  COUNT(*) AS page_views
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+WHERE _TABLE_SUFFIX BETWEEN '20210101' AND '20210131'
+  AND event_name = 'page_view'
+GROUP BY page_location
+HAVING page_location IS NOT NULL
+ORDER BY page_views DESC
+LIMIT 20;
+```
+
+This query extracts `page_location` from `event_params` and lists the most viewed pages. It could help identify popular content. The same person can create more than one page view.
+
+# Query 3: Sessions by day
+
+``` sql
+WITH session_events AS (
+  SELECT
+    PARSE_DATE('%Y%m%d', event_date) AS event_day,
+    user_pseudo_id,
+    (SELECT value.int_value
+     FROM UNNEST(event_params)
+     WHERE key = 'ga_session_id') AS ga_session_id
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE _TABLE_SUFFIX BETWEEN '20210101' AND '20210131'
+    AND event_name = 'session_start'
+)
+SELECT
+  event_day,
+  COUNT(DISTINCT CONCAT(
+    user_pseudo_id, '-', CAST(ga_session_id AS STRING)
+  )) AS sessions
+FROM session_events
+WHERE ga_session_id IS NOT NULL
+GROUP BY event_day
+ORDER BY event_day;
+```
+
+This query uses `ga_session_id` and `user_pseudo_id` to count sessions by day. It is more useful than counting only `session_start` rows when making a session key. Missing session IDs are left out.
+
+# Query 4: Revenue by day
+
+``` sql
+SELECT
+  PARSE_DATE('%Y%m%d', event_date) AS event_day,
+  COUNT(*) AS purchase_events,
+  ROUND(SUM(ecommerce.purchase_revenue), 2) AS purchase_revenue
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+WHERE _TABLE_SUFFIX BETWEEN '20210101' AND '20210131'
+  AND event_name = 'purchase'
+GROUP BY event_day
+ORDER BY event_day;
+```
+
+This query shows purchase events and purchase revenue for each day. It can be used to find stronger sales days. Revenue may be missing for some events, so the totals should still be checked.
+
+# Query 5: Users by traffic source
+
+``` sql
+SELECT
+  COALESCE(traffic_source.source, '(not set)') AS source,
+  COALESCE(traffic_source.medium, '(not set)') AS medium,
+  COUNT(DISTINCT user_pseudo_id) AS users
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+WHERE _TABLE_SUFFIX BETWEEN '20210101' AND '20210131'
+GROUP BY source, medium
+ORDER BY users DESC
+LIMIT 20;
+```
+
+This query compares users across traffic source and medium. It gives a basic view of where visitors came from. `user_pseudo_id` represents a device or browser and may not equal a known customer.
+
+# Query 6: Simple ecommerce funnel
+
+``` sql
+WITH funnel_events AS (
+  SELECT
+    user_pseudo_id,
+    event_name
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE _TABLE_SUFFIX BETWEEN '20210101' AND '20210131'
+    AND event_name IN ('view_item', 'add_to_cart', 'purchase')
+)
+SELECT
+  COUNT(DISTINCT IF(event_name = 'view_item', user_pseudo_id, NULL))
+    AS item_view_users,
+  COUNT(DISTINCT IF(event_name = 'add_to_cart', user_pseudo_id, NULL))
+    AS add_to_cart_users,
+  COUNT(DISTINCT IF(event_name = 'purchase', user_pseudo_id, NULL))
+    AS purchase_users
+FROM funnel_events;
+```
+
+This query gives a simple funnel from item view to cart to purchase. It can show where the largest drop happens. It does not prove that every user completed the steps in the correct order.
+
+# Query 7: Join page views and purchases
+
+``` sql
+WITH daily_page_views AS (
+  SELECT
+    PARSE_DATE('%Y%m%d', event_date) AS event_day,
+    COUNT(*) AS page_views
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE _TABLE_SUFFIX BETWEEN '20210101' AND '20210131'
+    AND event_name = 'page_view'
+  GROUP BY event_day
+),
+daily_purchases AS (
+  SELECT
+    PARSE_DATE('%Y%m%d', event_date) AS event_day,
+    COUNT(*) AS purchases
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE _TABLE_SUFFIX BETWEEN '20210101' AND '20210131'
+    AND event_name = 'purchase'
+  GROUP BY event_day
+)
+SELECT
+  COALESCE(v.event_day, p.event_day) AS event_day,
+  COALESCE(v.page_views, 0) AS page_views,
+  COALESCE(p.purchases, 0) AS purchases
+FROM daily_page_views AS v
+FULL OUTER JOIN daily_purchases AS p
+  ON v.event_day = p.event_day
+ORDER BY event_day;
+```
+
+This query joins daily page views with daily purchases. It makes it easier to compare traffic and buying activity on the same date. The two numbers may move together, but this alone does not show causation.
+
+# Query 8: Most common outbound links
+
+``` sql
+WITH click_data AS (
+  SELECT
+    (SELECT value.string_value
+     FROM UNNEST(event_params)
+     WHERE key = 'link_url') AS link_url
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE _TABLE_SUFFIX BETWEEN '20210101' AND '20210131'
+    AND event_name = 'click'
+)
+SELECT
+  link_url,
+  COUNT(*) AS clicks
+FROM click_data
+WHERE link_url IS NOT NULL
+GROUP BY link_url
+ORDER BY clicks DESC
+LIMIT 20;
+```
+
+This query extracts `link_url` and counts the most common tracked clicks. It may help show which external links receive attention. If link tracking was not configured, the result may contain few rows.
+
+# Short summary
+
+These queries cover basic filtering, grouping, parameter extraction, CTEs, and a join. The results give a small overview of traffic, pages, sessions, purchases, sources, funnel activity, and clicks. A real analysis would probably need more checking of GA4 definitions.
+
+# Appendix
+
+-   GitHub repository:
+-   GitHub Pages:
